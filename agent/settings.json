@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__vsp-lab__GetSource",
+      "mcp__vsp-lab__GetClassInclude",
+      "mcp__vsp-lab__GetRevisions",
+      "mcp__vsp-lab__GetRevisionSource",
+      "mcp__vsp-lab__GrepObject",
+      "mcp__vsp-lab__SearchObject",
+      "mcp__vsp-lab__GetCDSDependencies",
+      "mcp__vsp-lab__SyntaxCheck",
+      "mcp__vsp-lab__CreateTestInclude",
+      "mcp__vsp-lab__UpdateClassInclude",
+      "mcp__vsp-lab__Activate",
+      "mcp__vsp-lab__RunUnitTests"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__vsp-lab__UpdateClassInclude|mcp__vsp-lab__Activate|mcp__vsp-lab__CreateTestInclude|mcp__vsp-lab__UpdateSource|mcp__vsp-lab__WriteSource|mcp__vsp-lab__EditSource",
+        "hooks": [{ "type": "command", "command": "node agent/lab-guard.mjs" }]
+      }
+    ]
+  }
+}

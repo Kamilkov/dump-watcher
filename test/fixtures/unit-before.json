@@ -1,0 +1,70 @@
+{
+  "classes": [
+    {
+      "uri": "/sap/bc/adt/oo/classes/zcl_dl_pricing#testclass=LTC_DUMP_REPRO",
+      "type": "CLAS/OP",
+      "name": "LTC_DUMP_REPRO",
+      "parentUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing",
+      "parentType": "CLAS/OC",
+      "parentName": "ZCL_DL_PRICING",
+      "uriType": "semantic",
+      "navigationUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing/includes/testclasses#type=CLAS%2FOCL;name=LTC_DUMP_REPRO",
+      "durationCategory": "short",
+      "riskLevel": "harmless",
+      "testMethods": [],
+      "alerts": [
+        {
+          "kind": "runtimeAbortion",
+          "severity": "fatal",
+          "title": "Failed due to a runtime abortion",
+          "details": [
+            "Field symbol has not been assigned yet.",
+            "The ST22 runtime error was determined by a simple heuristic. However, this result could be flawed if another process of the user has also caused a runtime abortion recently",
+            "Runtime Error: GETWA_NOT_ASSIGNED",
+            "User: VSP",
+            "Application Server: vhcala4hci_A4H_00",
+            "Date: 20261001",
+            "Time: 184916"
+          ],
+          "stack": [
+            {
+              "uri": "/sap/bc/adt/oo/classes/zcl_dl_pricing/source/main#start=34,0;end=34,0",
+              "type": "CLAS/OC",
+              "name": "ZCL_DL_PRICING",
+              "description": "Include: <ZCL_DL_PRICING================CM001> Line: <15> (DISCOUNT_PCT)"
+            },
+            {
+              "uri": "/sap/bc/adt/oo/classes/zcl_dl_pricing/includes/testclasses#start=56,0;end=56,0",
+              "type": "CLAS/OCN/testclasses",
+              "name": "ZCL_DL_PRICING",
+              "description": "Include: <ZCL_DL_PRICING================CCAU> Line: <56> (SMALL_ORDER_HAS_NO_DISCOUNT)"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "uri": "/sap/bc/adt/oo/classes/zcl_dl_pricing#testclass=LTC_PRICING",
+      "type": "CLAS/OP",
+      "name": "LTC_PRICING",
+      "parentUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing",
+      "parentType": "CLAS/OC",
+      "parentName": "ZCL_DL_PRICING",
+      "uriType": "semantic",
+      "navigationUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing/includes/testclasses#type=CLAS%2FOCL;name=LTC_PRICING",
+      "durationCategory": "short",
+      "riskLevel": "harmless",
+      "testMethods": [
+        {
+          "uri": "/sap/bc/adt/oo/classes/zcl_dl_pricing#testclass=LTC_PRICING;testmethod=MEDIUM_ORDER_GETS_5_PERCENT",
+          "type": "CLAS/OLI",
+          "name": "MEDIUM_ORDER_GETS_5_PERCENT",
+          "executionTime": 0.05,
+          "uriType": "semantic",
+          "navigationUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing/includes/testclasses#type=CLAS%2FOLI;name=LTC_PRICING%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20MEDIUM_ORDER_GETS_5_PERCENT",
+          "unit": "s"
+        }
+      ]
+    }
+  ]
+}

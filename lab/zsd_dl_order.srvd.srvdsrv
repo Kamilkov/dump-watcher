@@ -1,0 +1,5 @@
+@EndUserText.label: 'Dump lab: orders'
+define service ZSD_DL_ORDER {
+  expose ZC_DL_Order;
+  expose ZC_DL_CustomerVH;
+}

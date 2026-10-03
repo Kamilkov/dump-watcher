@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "vsp-lab": {
+      "command": "ssh",
+      "args": [
+        "-o", "LogLevel=ERROR",
+        "-o", "BatchMode=yes",
+        "vps",
+        "cd /root && vsp --mode expert --allowed-packages '$ZDUMP_LAB' --block-free-sql --disallowed-ops DX"
+      ]
+    }
+  }
+}

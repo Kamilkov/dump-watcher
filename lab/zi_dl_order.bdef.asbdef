@@ -1,0 +1,22 @@
+managed implementation in class zbp_dl_order unique;
+strict ( 2 );
+
+define behavior for ZI_DL_Order alias LabOrder
+persistent table zdl_order
+lock master
+authorization master ( instance )
+{
+  field ( readonly ) OrderId;
+  internal update;
+  action recalculate result [1] $self;
+
+  mapping for zdl_order
+    {
+      OrderId     = order_id;
+      Customer    = customer;
+      Product     = product;
+      Quantity    = quantity;
+      Currency    = currency;
+      DiscountPct = discount_pct;
+    }
+}

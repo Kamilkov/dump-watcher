@@ -1,0 +1,50 @@
+{
+  "classes": [
+    {
+      "uri": "/sap/bc/adt/oo/classes/zcl_dl_pricing#testclass=LTC_DUMP_REPRO",
+      "type": "CLAS/OP",
+      "name": "LTC_DUMP_REPRO",
+      "parentUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing",
+      "parentType": "CLAS/OC",
+      "parentName": "ZCL_DL_PRICING",
+      "uriType": "semantic",
+      "navigationUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing/includes/testclasses#type=CLAS%2FOCL;name=LTC_DUMP_REPRO",
+      "durationCategory": "short",
+      "riskLevel": "harmless",
+      "testMethods": [
+        {
+          "uri": "/sap/bc/adt/oo/classes/zcl_dl_pricing#testclass=LTC_DUMP_REPRO;testmethod=SMALL_ORDER_HAS_NO_DISCOUNT",
+          "type": "CLAS/OLI",
+          "name": "SMALL_ORDER_HAS_NO_DISCOUNT",
+          "executionTime": 0.02,
+          "uriType": "semantic",
+          "navigationUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing/includes/testclasses#type=CLAS%2FOLI;name=LTC_DUMP_REPRO%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20SMALL_ORDER_HAS_NO_DISCOUNT",
+          "unit": "s"
+        }
+      ]
+    },
+    {
+      "uri": "/sap/bc/adt/oo/classes/zcl_dl_pricing#testclass=LTC_PRICING",
+      "type": "CLAS/OP",
+      "name": "LTC_PRICING",
+      "parentUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing",
+      "parentType": "CLAS/OC",
+      "parentName": "ZCL_DL_PRICING",
+      "uriType": "semantic",
+      "navigationUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing/includes/testclasses#type=CLAS%2FOCL;name=LTC_PRICING",
+      "durationCategory": "short",
+      "riskLevel": "harmless",
+      "testMethods": [
+        {
+          "uri": "/sap/bc/adt/oo/classes/zcl_dl_pricing#testclass=LTC_PRICING;testmethod=MEDIUM_ORDER_GETS_5_PERCENT",
+          "type": "CLAS/OLI",
+          "name": "MEDIUM_ORDER_GETS_5_PERCENT",
+          "executionTime": 0.04,
+          "uriType": "semantic",
+          "navigationUri": "/sap/bc/adt/oo/classes/zcl_dl_pricing/includes/testclasses#type=CLAS%2FOLI;name=LTC_PRICING%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20MEDIUM_ORDER_GETS_5_PERCENT",
+          "unit": "s"
+        }
+      ]
+    }
+  ]
+}

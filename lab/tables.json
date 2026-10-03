@@ -1,0 +1,23 @@
+{
+  "_note": "Arguments for vsp CreateTable. The tool adds 'key client : abap.clnt' itself; activate after creating.",
+  "ZDL_CONFIG": {
+    "description": "Dump lab: configuration per currency",
+    "delivery_class": "C",
+    "fields": [
+      { "name": "CURRENCY", "type": "CHAR5", "key": true },
+      { "name": "DESCRIPTION", "type": "CHAR40" }
+    ]
+  },
+  "ZDL_ORDER": {
+    "description": "Dump lab: orders",
+    "delivery_class": "A",
+    "fields": [
+      { "name": "ORDER_ID", "type": "NUMC10", "key": true },
+      { "name": "CUSTOMER", "type": "CHAR40" },
+      { "name": "PRODUCT", "type": "CHAR40" },
+      { "name": "QUANTITY", "type": "INT4" },
+      { "name": "CURRENCY", "type": "CHAR5" },
+      { "name": "DISCOUNT_PCT", "type": "INT4" }
+    ]
+  }
+}

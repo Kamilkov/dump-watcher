@@ -1,0 +1,7 @@
+projection;
+strict ( 2 );
+
+define behavior for ZC_DL_Order alias LabOrder
+{
+  use action recalculate;
+}
