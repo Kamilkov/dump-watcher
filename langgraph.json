@@ -1,0 +1,5 @@
+{
+  "node_version": "22",
+  "graphs": { "dump_watcher": "./graph.mjs:studioGraph" },
+  "env": ".env"
+}

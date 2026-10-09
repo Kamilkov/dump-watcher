@@ -3,153 +3,23 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TOKEN_TTL_MS, createStore, createWatcher, sourceHash } from './core.mjs';
+import { TOKEN_TTL_MS, createStore, resetLab, sourceHash } from './core.mjs';
+import {
+  DDL, DDL_FIXED, DUMPED, FIXED, ORIGINAL, agentReturning, cdsFix, classFix, crashAt, dataFix, dumpEntry, fakeSap, openProposal, setup, unitRun,
+} from './test/fakes.mjs';
 
-export const ORIGINAL = "CLASS zcl_dl_pricing IMPLEMENTATION.\n  METHOD discount_pct.\n    RAISE SHORTDUMP TYPE zcx_dl_config_missing.\n    result = <tier>-discount_pct.\n  ENDMETHOD.\nENDCLASS.";
-export const FIXED = ORIGINAL.replace('result = <tier>-discount_pct.', 'IF <tier> IS ASSIGNED.\n      result = <tier>-discount_pct.\n    ENDIF.');
-export const DDL = "define view entity ZC_DL_Order { @Consumption.valueHelpDefinition: [{ entity: { name: 'ZC_DL_Order' } }] Customer }";
-export const DDL_FIXED = DDL.replace("name: 'ZC_DL_Order'", "name: 'ZI_DL_CustomerVH'");
-const DUMPED = [{ kind: 'exception', severity: 'critical', title: 'Runtime Error GETWA_NOT_ASSIGNED' }];
+// ---------- the fake ----------
 
-export function unitRun(reproAlerts) {
-  return { classes: [
-    { name: 'LTC_PRICING', testMethods: [{ name: 'MEDIUM_ORDER_GETS_5_PERCENT' }] },
-    { name: 'LTC_DUMP_REPRO', testMethods: [{ name: 'SMALL_ORDER_HAS_NO_DISCOUNT', ...(reproAlerts ? { alerts: reproAlerts } : {}) }] },
-  ] };
-}
-
-export function fakeSap() {
-  const sap = {
-    sources: { ZCL_DL_PRICING: ORIGINAL, ZC_DL_ORDER: DDL },
-    tests: 'CLASS ltc_pricing ... CLASS ltc_dump_repro ...',
-    dumps: [],
-    detailFor: (id) => ({ errorType: 'GETWA_NOT_ASSIGNED', program: 'ZCL_DL_PRICING===CP', include: 'ZCL_DL_PRICING===CM001', line: 14, procedure: 'DISCOUNT_PCT', mainProgram: 'SAPMHTTP', stack: [], source: [], variables: [] }),
-    calls: [],
-    handlers: {
-      ListDumps: () => ({ dumps: sap.dumps }),
-      GetDump: ({ dump_id }) => ({ dump: sap.dumps.find((d) => d.id === dump_id), detail: sap.detailFor(dump_id) }),
-      SearchObject: ({ query }) => [{ Name: query.toUpperCase(), PackageName: '$ZDUMP_LAB' }],
-      SyntaxCheck: () => null,
-      GetSource: ({ name, include }) => {
-        const source = include === 'testclasses' ? sap.tests : sap.sources[name.toUpperCase()];
-        return { source, sourceHash: sourceHash(source) };
-      },
-      RunUnitTests: () => unitRun(sap.sources.ZCL_DL_PRICING === FIXED ? null : DUMPED),
-      WriteSource: ({ name, source, expected_source_hash, package: pkg }) => {
-        if (pkg !== '$ZDUMP_LAB') throw new Error('WriteSource: an explicit package is required');
-        if (expected_source_hash && expected_source_hash !== sourceHash(sap.sources[name])) throw new Error('WriteSource: SOURCE_DRIFT: expected source hash differs');
-        sap.sources[name] = source;
-        return { success: true };
-      },
-      UpdateClassInclude: ({ source }) => { sap.tests = source; return 'Class include updated successfully'; },
-      Activate: () => ({ success: true }),
-    },
-    async call(tool, args) {
-      sap.calls.push([tool, args]);
-      const handler = sap.handlers[tool];
-      if (!handler) throw new Error(`unexpected tool ${tool}`);
-      return handler(args);
-    },
-  };
-  return sap;
-}
-
-export const classFix = {
-  verdict: 'code_fix', cause: 'Orders under 10 units match no discount tier.', explanation: 'The loop leaves <tier> unassigned.',
-  object: { type: 'CLAS', name: 'ZCL_DL_PRICING' }, fixed_source: FIXED,
-  test: { class: 'LTC_DUMP_REPRO', method: 'small_order_has_no_discount' }, verification: 'unit_test', confidence: 'high',
-};
-export const cdsFix = { ...classFix, object: { type: 'DDLS', name: 'ZC_DL_ORDER' }, fixed_source: DDL_FIXED, test: null, verification: 'manual_reclick' };
-
-export function agentReturning(result, sap, { readName = result?.object?.name ?? 'ZCL_DL_PRICING' } = {}) {
-  const agent = async () => {
-    agent.runs += 1;
-    const source = sap.sources[readName];
-    return {
-      finalText: result === null ? 'I could not decide.' : `Done.\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\``,
-      toolResults: readName ? [{ name: 'mcp__vsp-lab__GetSource', input: { name: readName, include_hash: true }, output: JSON.stringify({ source, sourceHash: sourceHash(source) }), isError: false }] : [],
-    };
-  };
-  agent.runs = 0;
-  return agent;
-}
-
-export const dumpEntry = (id, user = 'DEMO', at = '2026-10-01T09:59:58Z') => ({ id, at, user, errorType: 'GETWA_NOT_ASSIGNED', program: 'ZCL_DL_PRICING===CP', message: 'x' });
-
-export function setup({ sap = fakeSap(), result = classFix, runAgent, notify, sleep } = {}) {
-  const store = createStore(mkdtempSync(join(tmpdir(), 'dump-watcher-')));
-  const notes = [];
-  let clock = Date.parse('2026-10-01T10:00:00Z');
-  const agent = runAgent ?? agentReturning(result, sap);
-  const watcher = createWatcher({
-    vsp: sap, store, runAgent: agent, diff: async () => '--- diff', demoUser: 'DEMO', log: () => {},
-    notify: notify ?? (async (n) => { notes.push(n); }),
-    pageUrl: (id, view) => `http://test/p/${id}?v=${view}`,
-    now: () => clock,
-    sleep: async (ms) => { clock += ms; await sleep?.(ms); },
-  });
-  return { sap, store, watcher, notes, agent, tick: (ms) => { clock += ms; } };
-}
-
-export const openProposal = (store) => store.proposal(store.status().proposalId);
-
-test('a new DEMO dump becomes an open, bound proposal', async () => {
-  const { sap, store, watcher, notes } = setup();
-  sap.dumps = [dumpEntry('d1')];
-  assert.equal(await watcher.checkDumps(), 1);
-  assert.equal(await watcher.checkDumps(), 0);
-  assert.equal(store.status().state, 'awaiting_decision');
-  const p = openProposal(store);
-  assert.equal(p.status, 'open');
-  assert.equal(p.original.hash, sourceHash(ORIGINAL));
-  assert.equal(p.testHash, sourceHash(sap.tests));
-  assert.ok(p.token && p.view);
-  assert.equal(notes.length, 1);
-  assert.equal(notes[0].priority, 'high');
-  assert.equal(notes[0].click, `http://test/p/${p.id}?v=${p.view}`);
-  assert.ok(store.seen().has('d1'));
+test('the fake SAP shows saved text at once, but runs it only after activation', async () => {
+  const sap = fakeSap();
+  await sap.call('UpdateClassInclude', { class_name: 'ZCL_DL_PRICING', source: 'saved tests' });
+  assert.equal((await sap.call('GetSource', { name: 'ZCL_DL_PRICING', include: 'testclasses' })).source, 'saved tests');
+  assert.notEqual(sap.tests, 'saved tests');
+  await sap.call('Activate', { object_name: 'ZCL_DL_PRICING' });
+  assert.equal(sap.tests, 'saved tests');
 });
 
-test('dumps of other users are ignored', async () => {
-  const { sap, store, watcher, agent } = setup();
-  sap.dumps = [dumpEntry('d1', 'DEVELOPER')];
-  await watcher.checkDumps();
-  assert.equal(agent.runs, 0);
-  assert.equal(store.status().state, 'idle');
-});
-
-test('a dump reported by trace and poll at once is analyzed once', async () => {
-  const { sap, watcher, agent } = setup();
-  sap.dumps = [dumpEntry('d1')];
-  await Promise.all([watcher.checkDumps(), watcher.checkDumps()]);
-  assert.equal(agent.runs, 1);
-});
-
-test('a repeated dump only raises the counter of the open proposal', async () => {
-  const { sap, store, watcher, agent } = setup();
-  sap.dumps = [dumpEntry('d1')];
-  await watcher.checkDumps();
-  sap.dumps.push(dumpEntry('d2', 'DEMO', '2026-10-01T09:59:59Z'));
-  await watcher.checkDumps();
-  assert.equal(agent.runs, 1);
-  assert.equal(openProposal(store).count, 2);
-  assert.ok(store.seen().has('d2'));
-});
-
-test('a different dump waits until the open proposal ends, then is analyzed', async () => {
-  const { sap, store, watcher, agent, tick } = setup();
-  sap.detailFor = (id) => ({ ...fakeSap().detailFor(id), line: id === 'd2' ? 99 : 14 });
-  sap.dumps = [dumpEntry('d1')];
-  await watcher.checkDumps();
-  sap.dumps.push(dumpEntry('d2', 'DEMO', '2026-10-01T09:59:59Z'));
-  await watcher.checkDumps();
-  assert.equal(agent.runs, 1);
-  tick(TOKEN_TTL_MS + 1);
-  await watcher.expireOpen();
-  await watcher.checkDumps();
-  assert.equal(agent.runs, 2);
-  assert.equal(store.proposals().filter((p) => p.status === 'expired').length, 1);
-});
+// ---------- v1 only: the Claude Code agent's output ----------
 
 test('no JSON from the agent gives an informational unsure result', async () => {
   const { sap, store, watcher, notes } = setup({ result: null });
@@ -215,6 +85,8 @@ test('an agent failure is reported once and not retried', async () => {
   assert.ok(store.seen().has('d1'));
 });
 
+// ---------- shared code, tested once ----------
+
 test('SAP down during intake leaves the watcher idle and working', async () => {
   const { sap, store, watcher, agent } = setup();
   sap.dumps = [dumpEntry('d1')];
@@ -268,22 +140,6 @@ test('notify failing does not break the flow', async () => {
   assert.equal(store.status().state, 'awaiting_decision');
 });
 
-test('restart recovery: applying needs recovery, analyzing is redone', async () => {
-  const a = setup();
-  a.store.setStatus('applying', { proposalId: 'abc123' });
-  await a.watcher.recoverOnStartup();
-  assert.equal(a.store.status().state, 'recovery_required');
-  assert.match(a.notes[0].body, /node watcher.mjs reset/);
-
-  const b = setup();
-  b.store.setStatus('analyzing', { dumpId: 'd1' });
-  await b.watcher.recoverOnStartup();
-  assert.equal(b.store.status().state, 'idle');
-  b.sap.dumps = [dumpEntry('d1')];
-  await b.watcher.checkDumps();
-  assert.equal(b.agent.runs, 1);
-});
-
 test('the first start ignores older dumps', async () => {
   const { sap, store, watcher, agent } = setup();
   assert.equal(store.isFresh(), true);
@@ -294,126 +150,22 @@ test('the first start ignores older dumps', async () => {
   assert.equal(agent.runs, 0);
 });
 
-import { resetLab } from './core.mjs';
-
-const proposed = async (args) => {
-  const ctx = setup(args);
-  ctx.sap.dumps = [dumpEntry('d1')];
+test('the analysis runs under its proposal id', async () => {
+  const sap = fakeSap();
+  const agent = agentReturning(classFix, sap);
+  let during;
+  const ctx = setup({ sap, runAgent: Object.assign(async (summary) => { during = ctx.store.status(); return agent(summary); }, { runs: 0 }) });
+  sap.dumps = [dumpEntry('d1')];
   await ctx.watcher.checkDumps();
-  const p = openProposal(ctx.store);
-  return { ...ctx, p, writesOf: (source) => ctx.sap.calls.filter(([t, a]) => t === 'WriteSource' && a.source === source).length };
-};
-
-test('approve applies exactly the reviewed fix and verifies it', async () => {
-  const { sap, store, watcher, notes, p, writesOf } = await proposed();
-  assert.equal(await watcher.act('approve', p.id, p.token), 'Fixed ✅ Tests pass');
-  const write = sap.calls.find(([t, a]) => t === 'WriteSource' && a.source === FIXED)[1];
-  assert.equal(write.expected_source_hash, sourceHash(ORIGINAL));
-  assert.equal(writesOf(FIXED), 1);
-  assert.equal(store.status().state, 'idle');
-  assert.equal(store.proposal(p.id).status, 'fixed');
-  assert.equal(notes.at(-1).body, 'Fixed ✅ Tests pass');
-});
-
-test('a double tap writes the fix once', async () => {
-  const { watcher, p, writesOf } = await proposed();
-  const answers = await Promise.all([watcher.act('approve', p.id, p.token), watcher.act('approve', p.id, p.token)]);
-  assert.equal(writesOf(FIXED), 1);
-  assert.equal(answers.filter((a) => a.startsWith('Fixed')).length, 1);
-});
-
-test('an expired or wrong token is refused', async () => {
-  const { watcher, p, tick, writesOf } = await proposed();
-  assert.equal(await watcher.act('approve', p.id, 'not-the-token'), 'Invalid or expired link');
-  tick(TOKEN_TTL_MS + 1);
-  assert.equal(await watcher.act('approve', p.id, p.token), 'Invalid or expired link');
-  assert.equal(writesOf(FIXED), 0);
-});
-
-test('changed tests make the proposal stale without writing', async () => {
-  const { sap, store, watcher, p, writesOf } = await proposed();
-  sap.tests = 'someone changed the tests';
-  assert.match(await watcher.act('approve', p.id, p.token), /Stale: the tests changed/);
-  assert.equal(writesOf(FIXED), 0);
-  assert.equal(store.status().state, 'idle');
-});
-
-test('a changed source makes the proposal stale without writing', async () => {
-  const { sap, store, watcher, p } = await proposed();
-  sap.sources.ZCL_DL_PRICING = 'someone else edited this';
-  assert.match(await watcher.act('approve', p.id, p.token), /Stale: ZCL_DL_PRICING changed/);
-  assert.equal(sap.sources.ZCL_DL_PRICING, 'someone else edited this');
-  assert.equal(store.proposal(p.id).status, 'stale');
-  assert.equal(store.status().state, 'idle');
-});
-
-test('failing tests after the fix lead to a verified restore', async () => {
-  const sap = fakeSap();
-  sap.handlers.RunUnitTests = () => unitRun([{ kind: 'exception', title: 'Runtime Error GETWA_NOT_ASSIGNED' }]);
-  const { store, watcher, p } = await proposed({ sap });
-  assert.match(await watcher.act('approve', p.id, p.token), /^Reverted ❌ the new test still fails/);
-  assert.equal(sap.sources.ZCL_DL_PRICING, ORIGINAL);
-  assert.equal(store.status().state, 'idle');
-});
-
-test('a failed restore requires recovery and blocks further work', async () => {
-  const sap = fakeSap();
-  sap.handlers.RunUnitTests = () => unitRun([{ kind: 'exception', title: 'Runtime Error GETWA_NOT_ASSIGNED' }]);
-  const write = sap.handlers.WriteSource;
-  sap.handlers.WriteSource = (args) => {
-    if (args.source === ORIGINAL) throw new Error('WriteSource: connection reset');
-    return write(args);
-  };
-  const { store, watcher, p, agent } = await proposed({ sap });
-  assert.match(await watcher.act('approve', p.id, p.token), /^Recovery required/);
-  assert.equal(store.status().state, 'recovery_required');
-  sap.dumps.push(dumpEntry('d2', 'DEMO', '2026-10-01T09:59:59Z'));
-  sap.detailFor = (id) => ({ ...fakeSap().detailFor(id), line: 77 });
-  await watcher.checkDumps();
-  assert.equal(agent.runs, 1);
-  assert.equal(await watcher.act('approve', p.id, p.token), 'This proposal is no longer open');
-});
-
-test('a restore that cannot be verified requires recovery', async () => {
-  const sap = fakeSap();
-  sap.handlers.RunUnitTests = () => unitRun([{ kind: 'exception', title: 'Runtime Error GETWA_NOT_ASSIGNED' }]);
-  const { store, watcher, p } = await proposed({ sap });
-  const write = sap.handlers.WriteSource;
-  // The restore "succeeds" but SAP ends up with something other than the original.
-  sap.handlers.WriteSource = (args) => write(args.source === ORIGINAL ? { ...args, source: `${ORIGINAL}\n* drift` } : args);
-  assert.match(await watcher.act('approve', p.id, p.token), /^Recovery required/);
-  assert.equal(store.status().state, 'recovery_required');
-});
-
-test('a CDS fix waits for the re-click, then is confirmed', async () => {
-  const { sap, store, watcher, p } = await proposed({ result: cdsFix });
-  assert.equal(p.testHash, undefined);
-  assert.equal(await watcher.act('approve', p.id, p.token), 'Applied: open the value help to confirm');
-  assert.equal(sap.sources.ZC_DL_ORDER, DDL_FIXED);
-  assert.equal(store.status().state, 'awaiting_reclick');
-  const applied = store.proposal(p.id);
-  assert.ok(applied.token && applied.token !== p.token);
-  assert.equal(sap.calls.filter(([t]) => t === 'RunUnitTests').length, 0);
-  assert.equal(await watcher.act('works', p.id, applied.token), 'Fixed ✅ (confirmed by re-click)');
-  assert.equal(store.status().state, 'idle');
-});
-
-test('a CDS fix that is still broken is restored', async () => {
-  const { sap, store, watcher, p } = await proposed({ result: cdsFix });
-  await watcher.act('approve', p.id, p.token);
-  assert.match(await watcher.act('broken', p.id, store.proposal(p.id).token), /^Reverted ❌ still broken after re-click/);
-  assert.equal(sap.sources.ZC_DL_ORDER, DDL);
-});
-
-test('reject writes nothing', async () => {
-  const { store, watcher, p, writesOf } = await proposed();
-  assert.equal(await watcher.act('reject', p.id, p.token), 'Rejected: nothing was changed');
-  assert.equal(writesOf(FIXED), 0);
-  assert.equal(store.status().state, 'idle');
+  assert.equal(during.state, 'analyzing');
+  assert.equal(during.proposalId, openProposal(ctx.store).id);
 });
 
 test('reset restores the lab, checks hashes and cancels open proposals', async () => {
-  const { sap, store, p } = await proposed();
+  const { sap, store, watcher } = setup();
+  sap.dumps = [dumpEntry('d1')];
+  await watcher.checkDumps();
+  const p = openProposal(store);
   sap.sources.ZCL_DL_PRICING = FIXED;
   await resetLab({ vsp: sap, store }, [
     { type: 'CLAS', name: 'ZCL_DL_PRICING', include: 'testclasses', source: 'baseline tests' },
@@ -432,3 +184,303 @@ test('reset fails loudly when an object does not match afterwards', async () => 
   const store = createStore(mkdtempSync(join(tmpdir(), 'dump-watcher-')));
   await assert.rejects(resetLab({ vsp: sap, store }, [{ type: 'CLAS', name: 'ZCL_DL_PRICING', source: FIXED }]), /did not reset/);
 });
+
+// ---------- v1 recovery ----------
+
+test('restart recovery: applying needs recovery, analyzing is redone', async () => {
+  const a = setup();
+  a.store.setStatus('applying', { proposalId: 'abc123' });
+  await a.watcher.recoverOnStartup();
+  assert.equal(a.store.status().state, 'recovery_required');
+  assert.match(a.notes[0].body, /node watcher.mjs reset/);
+
+  const b = setup();
+  b.store.setStatus('analyzing', { dumpId: 'd1' });
+  await b.watcher.recoverOnStartup();
+  assert.equal(b.store.status().state, 'idle');
+  b.sap.dumps = [dumpEntry('d1')];
+  await b.watcher.checkDumps();
+  assert.equal(b.agent.runs, 1);
+});
+
+test('v1: a "Still broken" lost to a crash ends in recovery_required at startup', async () => {
+  const crash = crashAt('decision', 2); // the first decision is Approve, the second "Still broken"
+  const ctx = setup({ result: cdsFix, crash });
+  ctx.sap.dumps = [dumpEntry('d1')];
+  await ctx.watcher.checkDumps();
+  const p = openProposal(ctx.store);
+  await ctx.watcher.act('approve', p.id, p.token);
+  ctx.watcher.act('broken', p.id, ctx.store.proposal(p.id).token); // never answers: the watcher died
+  await crash.reached;
+  assert.equal(ctx.sap.sources.ZC_DL_ORDER, DDL_FIXED);
+  await ctx.make().recoverOnStartup();
+  assert.equal(ctx.store.status().state, 'recovery_required');
+  assert.match(ctx.notes.at(-1).body, /before undoing a fix/);
+});
+
+test("a watcher that dies before sending Couldn't analyze sends it after a restart, and analyzes the dump once", async () => {
+  const crash = crashAt('beforePush');
+  let runs = 0;
+  const runAgent = Object.assign(async () => { runs += 1; throw new Error('the agent took longer than 5 minutes'); }, { runs: 0 });
+  const ctx = setup({ runAgent, crash });
+  ctx.sap.dumps = [dumpEntry('d1')];
+  ctx.watcher.checkDumps(); // never answers: the watcher died with the failure saved and not yet sent
+  await crash.reached;
+  assert.equal(ctx.notes.length, 0);
+  const restarted = ctx.make();
+  await restarted.recoverOnStartup();
+  await restarted.checkDumps();
+  assert.equal(runs, 1);
+  assert.equal(ctx.notes.length, 1);
+  assert.match(ctx.notes[0].title, /Couldn't analyze GETWA_NOT_ASSIGNED/);
+  assert.ok(ctx.store.seen().has('d1'));
+  assert.equal(ctx.store.status().state, 'idle');
+});
+
+for (const point of ['beforePush', 'push']) {
+  test(`v1: a crash at ${point} while reporting never analyzes the dump twice`, async () => {
+    const crash = crashAt(point);
+    const ctx = setup({ result: dataFix, crash });
+    ctx.sap.dumps = [dumpEntry('d1')];
+    ctx.watcher.checkDumps(); // never answers: the watcher died while reporting
+    await crash.reached;
+    const restarted = ctx.make();
+    await restarted.recoverOnStartup();
+    await restarted.checkDumps();
+    assert.equal(ctx.agent.runs, 1);
+    assert.equal(ctx.store.proposals().length, 1);
+    assert.ok(ctx.store.seen().has('d1'));
+  });
+}
+
+// ---------- both engines ----------
+
+for (const engine of ['claude', 'langgraph']) {
+  const proposed = async (args = {}) => {
+    const ctx = setup({ engine, ...args });
+    ctx.sap.dumps = [dumpEntry('d1')];
+    await ctx.watcher.checkDumps();
+    const p = openProposal(ctx.store);
+    return { ...ctx, p, writesOf: (source) => ctx.sap.calls.filter(([t, a]) => t === 'WriteSource' && a.source === source).length };
+  };
+
+  test(`${engine}: a new DEMO dump becomes an open, bound proposal`, async () => {
+    const { sap, store, watcher, notes } = setup({ engine });
+    sap.dumps = [dumpEntry('d1')];
+    assert.equal(await watcher.checkDumps(), 1);
+    assert.equal(await watcher.checkDumps(), 0);
+    assert.equal(store.status().state, 'awaiting_decision');
+    const p = openProposal(store);
+    assert.equal(p.status, 'open');
+    assert.equal(p.original.hash, sourceHash(ORIGINAL));
+    assert.equal(p.testHash, sourceHash(sap.tests));
+    assert.ok(p.token && p.view);
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].priority, 'high');
+    assert.equal(notes[0].click, `http://test/p/${p.id}?v=${p.view}`);
+    assert.ok(store.seen().has('d1'));
+  });
+
+  test(`${engine}: dumps of other users are ignored`, async () => {
+    const { sap, store, watcher, runs } = setup({ engine });
+    sap.dumps = [dumpEntry('d1', 'DEVELOPER')];
+    await watcher.checkDumps();
+    assert.equal(runs(), 0);
+    assert.equal(store.status().state, 'idle');
+  });
+
+  test(`${engine}: a dump reported by trace and poll at once is analyzed once`, async () => {
+    const { sap, watcher, runs } = setup({ engine });
+    sap.dumps = [dumpEntry('d1')];
+    await Promise.all([watcher.checkDumps(), watcher.checkDumps()]);
+    assert.equal(runs(), 1);
+  });
+
+  test(`${engine}: a repeated dump only raises the counter of the open proposal`, async () => {
+    const { sap, store, watcher, runs } = setup({ engine });
+    sap.dumps = [dumpEntry('d1')];
+    await watcher.checkDumps();
+    sap.dumps.push(dumpEntry('d2', 'DEMO', '2026-10-01T09:59:59Z'));
+    await watcher.checkDumps();
+    assert.equal(runs(), 1);
+    assert.equal(openProposal(store).count, 2);
+    assert.ok(store.seen().has('d2'));
+  });
+
+  test(`${engine}: a different dump waits until the open proposal ends, then is analyzed`, async () => {
+    const { sap, store, watcher, runs, tick } = setup({ engine });
+    sap.detailFor = (id) => ({ ...fakeSap().detailFor(id), line: id === 'd2' ? 99 : 14 });
+    sap.dumps = [dumpEntry('d1')];
+    await watcher.checkDumps();
+    sap.dumps.push(dumpEntry('d2', 'DEMO', '2026-10-01T09:59:59Z'));
+    await watcher.checkDumps();
+    assert.equal(runs(), 1);
+    tick(TOKEN_TTL_MS + 1);
+    await watcher.expireOpen();
+    await watcher.checkDumps();
+    assert.equal(runs(), 2);
+    assert.equal(store.proposals().filter((p) => p.status === 'expired').length, 1);
+  });
+
+  test(`${engine}: using a token records the decision in the same save`, async () => {
+    const { store, watcher, p } = await proposed();
+    await watcher.act('reject', p.id, p.token);
+    assert.deepEqual(store.proposal(p.id).pending, { action: 'reject', pause: 'awaiting_decision' });
+  });
+
+  test(`${engine}: expiry is recorded as a decision too`, async () => {
+    const { store, watcher, p, tick } = await proposed();
+    tick(TOKEN_TTL_MS + 1);
+    await watcher.expireOpen();
+    const expired = store.proposal(p.id);
+    assert.deepEqual(expired.pending, { action: 'expire', pause: 'awaiting_decision' });
+    assert.equal(expired.status, 'expired');
+  });
+
+  test(`${engine}: approve applies exactly the reviewed fix and verifies it`, async () => {
+    const { sap, store, watcher, notes, p, writesOf } = await proposed();
+    assert.equal(await watcher.act('approve', p.id, p.token), 'Fixed ✅ Tests pass');
+    const write = sap.calls.find(([t, a]) => t === 'WriteSource' && a.source === FIXED)[1];
+    assert.equal(write.expected_source_hash, sourceHash(ORIGINAL));
+    assert.equal(writesOf(FIXED), 1);
+    assert.equal(store.status().state, 'idle');
+    assert.equal(store.proposal(p.id).status, 'fixed');
+    assert.equal(notes.at(-1).body, 'Fixed ✅ Tests pass');
+  });
+
+  test(`${engine}: a double tap writes the fix once`, async () => {
+    const { watcher, p, writesOf } = await proposed();
+    const answers = await Promise.all([watcher.act('approve', p.id, p.token), watcher.act('approve', p.id, p.token)]);
+    assert.equal(writesOf(FIXED), 1);
+    assert.equal(answers.filter((a) => a.startsWith('Fixed')).length, 1);
+  });
+
+  test(`${engine}: an expired or wrong token is refused`, async () => {
+    const { watcher, p, tick, writesOf } = await proposed();
+    assert.equal(await watcher.act('approve', p.id, 'not-the-token'), 'Invalid or expired link');
+    tick(TOKEN_TTL_MS + 1);
+    assert.equal(await watcher.act('approve', p.id, p.token), 'Invalid or expired link');
+    assert.equal(writesOf(FIXED), 0);
+  });
+
+  test(`${engine}: changed tests make the proposal stale without writing`, async () => {
+    const { sap, store, watcher, p, writesOf } = await proposed();
+    sap.tests = 'someone changed the tests';
+    assert.match(await watcher.act('approve', p.id, p.token), /Stale: the tests changed/);
+    assert.equal(writesOf(FIXED), 0);
+    assert.equal(store.status().state, 'idle');
+  });
+
+  test(`${engine}: a changed source makes the proposal stale without writing`, async () => {
+    const { sap, store, watcher, p } = await proposed();
+    sap.sources.ZCL_DL_PRICING = 'someone else edited this';
+    assert.match(await watcher.act('approve', p.id, p.token), /Stale: ZCL_DL_PRICING changed/);
+    assert.equal(sap.sources.ZCL_DL_PRICING, 'someone else edited this');
+    assert.equal(store.proposal(p.id).status, 'stale');
+    assert.equal(store.status().state, 'idle');
+  });
+
+  test(`${engine}: failing tests after the fix lead to a verified restore`, async () => {
+    const sap = fakeSap();
+    sap.handlers.RunUnitTests = () => unitRun(DUMPED);
+    const { store, watcher, p } = await proposed({ sap });
+    assert.match(await watcher.act('approve', p.id, p.token), /^Reverted ❌ the new test still fails/);
+    assert.equal(sap.sources.ZCL_DL_PRICING, ORIGINAL);
+    assert.equal(store.status().state, 'idle');
+  });
+
+  test(`${engine}: a failed write restores the original`, async () => {
+    const sap = fakeSap();
+    const write = sap.handlers.WriteSource;
+    sap.handlers.WriteSource = (args) => {
+      if (args.source === FIXED) throw new Error('WriteSource: lock failed');
+      return write(args);
+    };
+    const { watcher, p } = await proposed({ sap });
+    assert.match(await watcher.act('approve', p.id, p.token), /^Reverted ❌ writing the fix failed/);
+    assert.equal(sap.sources.ZCL_DL_PRICING, ORIGINAL);
+  });
+
+  test(`${engine}: a failed restore requires recovery and blocks further work`, async () => {
+    const sap = fakeSap();
+    sap.handlers.RunUnitTests = () => unitRun(DUMPED);
+    const write = sap.handlers.WriteSource;
+    sap.handlers.WriteSource = (args) => {
+      if (args.source === ORIGINAL) throw new Error('WriteSource: connection reset');
+      return write(args);
+    };
+    const { store, watcher, p, runs } = await proposed({ sap });
+    assert.match(await watcher.act('approve', p.id, p.token), /^Recovery required/);
+    assert.equal(store.status().state, 'recovery_required');
+    sap.dumps.push(dumpEntry('d2', 'DEMO', '2026-10-01T09:59:59Z'));
+    sap.detailFor = (id) => ({ ...fakeSap().detailFor(id), line: 77 });
+    await watcher.checkDumps();
+    assert.equal(runs(), 1);
+    assert.equal(await watcher.act('approve', p.id, p.token), 'This proposal is no longer open');
+  });
+
+  test(`${engine}: a restore that cannot be verified requires recovery`, async () => {
+    const sap = fakeSap();
+    sap.handlers.RunUnitTests = () => unitRun(DUMPED);
+    const { store, watcher, p } = await proposed({ sap });
+    const write = sap.handlers.WriteSource;
+    // The restore "succeeds", but SAP ends up with something other than the original.
+    sap.handlers.WriteSource = (args) => write(args.source === ORIGINAL ? { ...args, source: `${ORIGINAL}\n* drift` } : args);
+    assert.match(await watcher.act('approve', p.id, p.token), /^Recovery required/);
+    assert.equal(store.status().state, 'recovery_required');
+  });
+
+  test(`${engine}: a CDS fix waits for the re-click, then is confirmed`, async () => {
+    const { sap, store, watcher, p } = await proposed({ result: cdsFix });
+    assert.equal(p.testHash, undefined);
+    assert.equal(await watcher.act('approve', p.id, p.token), 'Applied: open the value help to confirm');
+    assert.equal(sap.sources.ZC_DL_ORDER, DDL_FIXED);
+    assert.equal(store.status().state, 'awaiting_reclick');
+    const applied = store.proposal(p.id);
+    assert.ok(applied.token && applied.token !== p.token);
+    assert.equal(sap.calls.filter(([t]) => t === 'RunUnitTests').length, 0);
+    assert.equal(await watcher.act('works', p.id, applied.token), 'Fixed ✅ (confirmed by re-click)');
+    assert.equal(store.status().state, 'idle');
+  });
+
+  test(`${engine}: a CDS fix that is still broken is restored`, async () => {
+    const { sap, store, watcher, p } = await proposed({ result: cdsFix });
+    await watcher.act('approve', p.id, p.token);
+    assert.match(await watcher.act('broken', p.id, store.proposal(p.id).token), /^Reverted ❌ still broken after re-click/);
+    assert.equal(sap.sources.ZC_DL_ORDER, DDL);
+  });
+
+  test(`${engine}: "Still broken" after somebody else edited the object leaves their edit alone`, async () => {
+    const { sap, store, watcher, p } = await proposed({ result: cdsFix });
+    await watcher.act('approve', p.id, p.token);
+    sap.sources.ZC_DL_ORDER = 'edited by someone';
+    assert.match(await watcher.act('broken', p.id, store.proposal(p.id).token), /^Recovery required/);
+    assert.equal(sap.sources.ZC_DL_ORDER, 'edited by someone');
+    assert.equal(store.status().state, 'recovery_required');
+  });
+
+  test(`${engine}: a restore that finds the original already back writes nothing`, async () => {
+    const { sap, store, watcher, p, writesOf } = await proposed({ result: cdsFix });
+    await watcher.act('approve', p.id, p.token);
+    sap.sources.ZC_DL_ORDER = DDL;
+    assert.match(await watcher.act('broken', p.id, store.proposal(p.id).token), /^Reverted ❌ still broken after re-click/);
+    assert.equal(writesOf(DDL), 0);
+  });
+
+  test(`${engine}: no re-click within an hour leaves the fix applied, unconfirmed`, async () => {
+    const { sap, store, watcher, p, tick } = await proposed({ result: cdsFix });
+    await watcher.act('approve', p.id, p.token);
+    tick(TOKEN_TTL_MS + 1);
+    await watcher.expireOpen();
+    assert.equal(store.proposal(p.id).status, 'expired');
+    assert.equal(sap.sources.ZC_DL_ORDER, DDL_FIXED);
+    assert.equal(store.status().state, 'idle');
+  });
+
+  test(`${engine}: reject writes nothing`, async () => {
+    const { store, watcher, p, writesOf } = await proposed();
+    assert.equal(await watcher.act('reject', p.id, p.token), 'Rejected: nothing was changed');
+    assert.equal(writesOf(FIXED), 0);
+    assert.equal(store.status().state, 'idle');
+  });
+}

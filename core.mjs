@@ -243,37 +243,111 @@ export function createStore(dir) {
   };
 }
 
+// ---------- SAP steps (both engines) ----------
+
+const noCrash = async () => {};
+const readSource = (vsp, type, name, include) =>
+  vsp.call('GetSource', { object_type: type, name, include_hash: true, include_context: false, ...(include ? { include } : {}) });
+
+// vsp saves, unlocks and then activates, and a plain read shows the saved text. Matching text says
+// nothing about the code SAP runs, so activate and read again.
+export async function confirmActive(vsp, { type, name, include, hash }) {
+  await vsp.call('Activate', { object_url: objectUrl(type, name), object_name: name });
+  return (await readSource(vsp, type, name, include)).sourceHash === hash;
+}
+
+// The write rule (spec section 6). Skips a write that already happened, writes only over a hash it
+// expects to replace, and leaves anything else alone. A failed write throws.
+export async function writeOwned({ vsp, crash = noCrash }, { type, name, include, source, replaces, point }) {
+  const target = sourceHash(source);
+  const current = (await readSource(vsp, type, name, include)).sourceHash;
+  if (current === target) {
+    try { return (await confirmActive(vsp, { type, name, include, hash: target })) ? 'skipped' : 'unconfirmed'; } catch { return 'unconfirmed'; }
+  }
+  if (!replaces.includes(current)) return 'foreign';
+  await vsp.call('WriteSource', { object_type: type, name, package: LAB_PACKAGE, source, expected_source_hash: current, ...(include ? { include } : {}) });
+  await crash(point);
+  return 'written';
+}
+
+export async function writeFix({ vsp, crash = noCrash }, p) {
+  const { type, name } = p.result.object;
+  await vsp.call('WriteSource', { object_type: type, name, package: LAB_PACKAGE, source: p.fixed, expected_source_hash: p.original.hash });
+  await crash('writeFix');
+}
+
+export async function runContract(vsp, { objectUrl: url, method, runtimeError }, phase) {
+  try {
+    return checkTestContract(await vsp.call('RunUnitTests', { object_url: url }), { method, runtimeError }, phase);
+  } catch (err) {
+    return `the tests could not run: ${err.message.slice(0, 120)}`;
+  }
+}
+
+// Puts the original back, but only over our own fix. Returns null when the original is back and
+// active, otherwise the reason it is not.
+export async function restoreOriginal(deps, p) {
+  const { type, name } = p.result.object;
+  try {
+    // Writing the class activates its test include too, so a changed include leaves the class alone.
+    if (p.testHash && (await readSource(deps.vsp, 'CLAS', name, 'testclasses')).sourceHash !== p.testHash) return `the test include of ${name} changed, so ${name} was left alone`;
+    const result = await writeOwned(deps, { type, name, source: p.original.source, replaces: [p.fixedHash], point: 'restoreOriginal' });
+    if (result === 'foreign') return `${name} holds neither the fix nor the original, so it was left alone`;
+    if (result === 'unconfirmed') return `${name} holds the original text, but it could not be confirmed active`;
+    const back = await readSource(deps.vsp, type, name);
+    return back.sourceHash === p.original.hash ? null : `${name} does not match the original after the restore`;
+  } catch (err) {
+    return `the restore failed: ${err.message.slice(0, 120)}`;
+  }
+}
+
 // ---------- watcher ----------
 
 const ACTIONABLE = new Set(['awaiting_decision', 'awaiting_reclick']);
 const DUMP_FIELDS = ['original', 'fixed', 'fixedHash', 'diff', 'testHash', 'testSource', 'objectUrl'];
+const STATE_FOR = { approve: 'awaiting_decision', reject: 'awaiting_decision', works: 'awaiting_reclick', broken: 'awaiting_reclick' };
 
+// What both engines share: intake, the queue, tokens and expiry. The engine analyzes a dump and carries
+// out a decision: { analyze(item), analyzeOnce(item), decide(action, proposal), recover() }.
 export function createWatcher({
-  vsp, store, runAgent, notify, diff, demoUser, pageUrl,
+  vsp, store, runAgent, notify, diff, demoUser, pageUrl, engine = claudeEngine,
   now = Date.now, log = console.log, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  crash = async () => {}, // CRASH_AFTER in watcher.mjs; the tests stop the flow here
 }) {
   const queue = []; // { entry, dump, key, count } waiting for an idle watcher
   let chain = Promise.resolve();
   const serial = (fn) => { const run = chain.then(fn); chain = run.catch(() => {}); return run; }; // one step at a time
 
-  const tell = async (message) => { try { await notify(message); } catch (err) { log(`notify failed: ${err.message}`); } };
+  const tell = async (message) => {
+    await crash('beforePush');
+    try { await notify(message); } catch (err) { log(`notify failed: ${err.message}`); }
+    await crash('push');
+  };
   const save = (p, status) => { p.status = status; store.saveProposal(p); };
   const issueToken = (p) => { p.token = randomBytes(16).toString('hex'); p.tokenAt = now(); };
-  const useToken = (p, token) => {
+  // One save uses the token and records the decision, so a crash can't lose an accepted decision.
+  const useToken = (p, token, pending) => {
     const ok = Boolean(p.token) && token === p.token && now() - p.tokenAt <= TOKEN_TTL_MS;
-    if (ok) { delete p.token; store.saveProposal(p); }
+    if (ok) { delete p.token; p.pending = pending; store.saveProposal(p); }
     return ok;
   };
   // The dump feed is slow to scan and lags ~30 s behind SAP; ask only for a recent window.
   const since = (windowMs) => new Date(now() - windowMs).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
+  // Sets the watcher's state; idle lets the next queued dump in once the current step is done.
+  const settle = (id, state) => {
+    store.setStatus(state, state === 'idle' ? {} : { proposalId: id });
+    if (state === 'idle') serial(drain).catch((err) => log(`queue failed: ${err.message}`));
+  };
+
   async function finish(p, status, state, message) {
     save(p, status);
-    store.setStatus(state, state === 'idle' ? {} : { proposalId: p.id });
+    settle(p.id, state);
     await tell({ title: p.title, body: message, click: pageUrl(p.id, p.view) });
-    if (state === 'idle') serial(drain).catch((err) => log(`queue failed: ${err.message}`));
     return message;
   }
+
+  const eng = engine({ vsp, store, runAgent, diff, pageUrl, now, log, crash, tell, save, issueToken, finish, settle });
 
   async function intake(windowMs) {
     const list = await vsp.call('ListDumps', { user: demoUser, since: since(windowMs), max_results: 100 });
@@ -303,28 +377,114 @@ export function createWatcher({
   }
 
   async function analyze(item) {
-    store.setStatus('analyzing', { dumpId: item.entry.id });
-    let p;
+    const id = randomBytes(6).toString('hex'); // the proposal id, and the thread id of the LangGraph engine
+    store.setStatus('analyzing', { dumpId: item.entry.id, proposalId: id, errorType: item.entry.errorType });
     try {
-      p = await buildProposal(item);
+      await eng.analyze({ ...item, id });
     } catch (err) {
-      store.markSeen(item.entry.id);
-      store.setStatus('idle');
-      await tell({ title: `Couldn't analyze ${item.entry.errorType}`, body: String(err.message).slice(0, 200) });
-      return;
+      return fail(item.entry.id, item.entry.errorType, err);
     }
     store.markSeen(item.entry.id);
-    store.saveProposal(p);
-    const actionable = p.status === 'open';
-    store.setStatus(actionable ? 'awaiting_decision' : 'idle', actionable ? { proposalId: p.id } : {});
-    await tell({ title: p.title, body: p.result.cause, click: pageUrl(p.id, p.view), priority: actionable ? 'high' : 'default' });
   }
 
-  async function buildProposal({ entry, dump, key, count }) {
+  // An analysis that threw. The message is saved before it is sent, so a restart sends it instead of
+  // analyzing the dump again. The dump is seen, and the watcher idle, only once it has gone out.
+  async function fail(dumpId, errorType, err) {
+    store.setStatus('failed', { dumpId, message: { title: `Couldn't analyze ${errorType}`, body: String(err.message).slice(0, 200) } });
+    await sendFailure();
+  }
+
+  async function sendFailure() {
+    const { dumpId, message } = store.status();
+    await tell(message);
+    store.markSeen(dumpId);
+    settle(null, 'idle');
+  }
+
+  // A failure saved but not sent goes out first. A recovery that throws mid-analysis ends like an analysis that threw.
+  async function recover() {
+    const s = store.status();
+    if (s.state === 'failed') return sendFailure();
+    try {
+      await eng.recover();
+    } catch (err) {
+      if (s.state !== 'analyzing') throw err;
+      await fail(s.dumpId, s.errorType, err);
+    }
+  }
+
+  async function expireOpen() {
+    const s = store.status();
+    if (!ACTIONABLE.has(s.state)) return;
+    const p = store.proposal(s.proposalId);
+    if (!p || now() - p.tokenAt <= TOKEN_TTL_MS) return;
+    delete p.token;
+    p.pending = { action: 'expire', pause: s.state };
+    store.saveProposal(p);
+    await crash('decision');
+    return eng.decide('expire', p);
+  }
+
+  async function ignoreOlderDumps() {
+    const fresh = newDemoDumps(await vsp.call('ListDumps', { user: demoUser, since: since(DAY_MS), max_results: 100 }), store.seen(), demoUser);
+    store.markSeen(...fresh.map((d) => d.id));
+    return fresh.length;
+  }
+
+  async function decide(action, id, token) {
+    const expected = STATE_FOR[action];
+    if (!expected) return `Unknown action ${action}`;
+    const s = store.status();
+    const p = store.proposal(id);
+    if (!p || s.proposalId !== id || s.state !== expected) return 'This proposal is no longer open';
+    if (!useToken(p, token, { action, pause: expected })) return 'Invalid or expired link';
+    await crash('decision');
+    return eng.decide(action, p);
+  }
+
+  const checkDumps = (windowMs = RECENT_MS) => serial(async () => { const found = await intake(windowMs); await drain(); return found; });
+
+  // SAP lists a dump in the ADT feed ~30 s after the trace line. Poll every 2 s until 60 s after the
+  // last trace line; a trace line during polling only extends the window, so one loop runs at a time.
+  let pollUntil = 0;
+  let polling = false;
+  async function afterTraceLine() {
+    pollUntil = now() + TRACE_POLL_MS;
+    if (polling) return;
+    polling = true;
+    try {
+      for (;;) {
+        await checkDumps();
+        if (now() >= pollUntil) return;
+        await sleep(2000);
+      }
+    } finally {
+      polling = false;
+    }
+  }
+
+  return {
+    checkDumps,
+    afterTraceLine,
+    analyzeOnce: (dumpId) => serial(async () => {
+      const dump = await vsp.call('GetDump', { dump_id: dumpId });
+      return eng.analyzeOnce({ entry: dump.dump, dump, key: dumpKey(dump.detail), count: 1, id: randomBytes(6).toString('hex') });
+    }),
+    act: (action, id, token) => serial(() => decide(action, id, token)),
+    expireOpen: () => serial(expireOpen),
+    recoverOnStartup: () => serial(recover),
+    ignoreOlderDumps,
+  };
+}
+
+// ---------- the Claude Code engine (v1) ----------
+
+export function claudeEngine({ vsp, store, runAgent, diff, pageUrl, now, log, crash, tell, save, issueToken, finish }) {
+  async function buildProposal({ entry, dump, key, count, id }) {
     const { finalText, toolResults } = await runAgent(summarizeDump(dump));
     const detail = dump.detail;
     const p = {
-      id: randomBytes(6).toString('hex'), view: randomBytes(16).toString('hex'),
+      id, view: randomBytes(16).toString('hex'),
       dumpId: entry.id, key, count, createdAt: now(), tokenAt: now(), runtimeError: detail.errorType,
       title: `${detail.errorType} in ${String(detail.program).replace(/=+CP$/, '')}`,
     };
@@ -378,52 +538,6 @@ export function createWatcher({
     return { problem: null, fix };
   }
 
-  async function expireOpen() {
-    const s = store.status();
-    if (!ACTIONABLE.has(s.state)) return;
-    const p = store.proposal(s.proposalId);
-    if (!p || now() - p.tokenAt <= TOKEN_TTL_MS) return;
-    delete p.token;
-    await finish(p, 'expired', 'idle', s.state === 'awaiting_reclick' ? 'Applied, unconfirmed (no re-click within an hour)' : 'Proposal expired');
-  }
-
-  async function recoverOnStartup() {
-    const s = store.status();
-    if (s.state === 'applying') {
-      const p = s.proposalId ? store.proposal(s.proposalId) : null;
-      if (p) { delete p.token; save(p, 'recovery_required'); }
-      store.setStatus('recovery_required', { proposalId: s.proposalId });
-      await tell({ title: 'Recovery required', body: 'The watcher stopped while applying a fix. Run: node watcher.mjs reset' });
-    } else if (s.state === 'analyzing') {
-      store.setStatus('idle'); // the dump is still unseen, so the next check analyzes it again
-    }
-  }
-
-  async function ignoreOlderDumps() {
-    const fresh = newDemoDumps(await vsp.call('ListDumps', { user: demoUser, since: since(DAY_MS), max_results: 100 }), store.seen(), demoUser);
-    store.markSeen(...fresh.map((d) => d.id));
-    return fresh.length;
-  }
-
-  const STATE_FOR = { approve: 'awaiting_decision', reject: 'awaiting_decision', works: 'awaiting_reclick', broken: 'awaiting_reclick' };
-
-  async function decide(action, id, token) {
-    const expected = STATE_FOR[action];
-    if (!expected) return `Unknown action ${action}`;
-    const s = store.status();
-    const p = store.proposal(id);
-    if (!p || s.proposalId !== id || s.state !== expected) return 'This proposal is no longer open';
-    if (!useToken(p, token)) return 'Invalid or expired link';
-    if (action === 'reject') return finish(p, 'rejected', 'idle', 'Rejected: nothing was changed');
-    if (action === 'works') return finish(p, 'confirmed', 'idle', 'Fixed ✅ (confirmed by re-click)');
-    if (action === 'broken') {
-      store.setStatus('applying', { proposalId: p.id });
-      save(p, 'applying');
-      return restore(p, 'still broken after re-click');
-    }
-    return apply(p);
-  }
-
   async function apply(p) {
     const { type, name } = p.result.object;
     if (p.testHash) {
@@ -433,7 +547,7 @@ export function createWatcher({
     store.setStatus('applying', { proposalId: p.id });
     save(p, 'applying');
     try {
-      await vsp.call('WriteSource', { object_type: type, name, package: LAB_PACKAGE, source: p.fixed, expected_source_hash: p.original.hash });
+      await writeFix({ vsp, crash }, p);
     } catch (err) {
       if (err.message.includes('SOURCE_DRIFT')) return finish(p, 'stale', 'idle', `Stale: ${name} changed since the proposal. Nothing was written`);
       return restore(p, `writing the fix failed: ${err.message.slice(0, 120)}`);
@@ -442,59 +556,52 @@ export function createWatcher({
       issueToken(p);
       return finish(p, 'awaiting_reclick', 'awaiting_reclick', 'Applied: open the value help to confirm');
     }
-    let broken;
-    try {
-      const run = await vsp.call('RunUnitTests', { object_url: p.objectUrl });
-      broken = checkTestContract(run, { method: p.result.test.method, runtimeError: p.runtimeError }, 'after');
-    } catch (err) {
-      broken = `the tests could not run: ${err.message.slice(0, 120)}`;
-    }
+    const broken = await runContract(vsp, { objectUrl: p.objectUrl, method: p.result.test.method, runtimeError: p.runtimeError }, 'after');
     return broken ? restore(p, broken) : finish(p, 'fixed', 'idle', 'Fixed ✅ Tests pass');
   }
 
   async function restore(p, reason) {
-    const { type, name } = p.result.object;
-    try {
-      await vsp.call('WriteSource', { object_type: type, name, package: LAB_PACKAGE, source: p.original.source });
-      const back = await vsp.call('GetSource', { object_type: type, name, include_hash: true, include_context: false });
-      if (back.sourceHash === p.original.hash) return finish(p, 'reverted', 'idle', `Reverted ❌ ${reason}`);
-    } catch { /* unverifiable: fall through to recovery */ }
+    const problem = await restoreOriginal({ vsp, crash }, p);
+    if (!problem) return finish(p, 'reverted', 'idle', `Reverted ❌ ${reason}`);
+    log(`restore: ${problem}`);
     delete p.token;
     return finish(p, 'recovery_required', 'recovery_required', `Recovery required: run node watcher.mjs reset (${reason})`);
   }
 
-  const checkDumps = (windowMs = RECENT_MS) => serial(async () => { const found = await intake(windowMs); await drain(); return found; });
-
-  // SAP lists a dump in the ADT feed ~30 s after the trace line. Poll every 2 s until 60 s after the
-  // last trace line; a trace line during polling only extends the window, so one loop runs at a time.
-  let pollUntil = 0;
-  let polling = false;
-  async function afterTraceLine() {
-    pollUntil = now() + TRACE_POLL_MS;
-    if (polling) return;
-    polling = true;
-    try {
-      for (;;) {
-        await checkDumps();
-        if (now() >= pollUntil) return;
-        await sleep(2000);
-      }
-    } finally {
-      polling = false;
-    }
-  }
-
   return {
-    checkDumps,
-    afterTraceLine,
-    analyzeOnce: (dumpId) => serial(async () => {
-      const dump = await vsp.call('GetDump', { dump_id: dumpId });
-      return buildProposal({ entry: dump.dump, dump, key: dumpKey(dump.detail), count: 1 });
-    }),
-    act: (action, id, token) => serial(() => decide(action, id, token)),
-    expireOpen: () => serial(expireOpen),
-    recoverOnStartup,
-    ignoreOlderDumps,
+    async analyze(item) {
+      const p = await buildProposal(item);
+      store.markSeen(item.entry.id); // seen before the proposal goes out: a crash can lose the push, never analyze twice
+      store.saveProposal(p);
+      const actionable = p.status === 'open';
+      store.setStatus(actionable ? 'awaiting_decision' : 'idle', actionable ? { proposalId: p.id } : {});
+      await tell({ title: p.title, body: p.result.cause, click: pageUrl(p.id, p.view), priority: actionable ? 'high' : 'default' });
+    },
+    analyzeOnce: buildProposal,
+    async decide(action, p) {
+      if (action === 'expire') return finish(p, 'expired', 'idle', p.pending?.pause === 'awaiting_reclick' ? 'Applied, unconfirmed (no re-click within an hour)' : 'Proposal expired');
+      if (action === 'reject') return finish(p, 'rejected', 'idle', 'Rejected: nothing was changed');
+      if (action === 'works') return finish(p, 'confirmed', 'idle', 'Fixed ✅ (confirmed by re-click)');
+      if (action === 'broken') {
+        store.setStatus('applying', { proposalId: p.id });
+        save(p, 'applying');
+        return restore(p, 'still broken after re-click');
+      }
+      return apply(p);
+    },
+    async recover() {
+      const s = store.status();
+      const p = s.proposalId ? store.proposal(s.proposalId) : null;
+      // "Still broken" was accepted, but the restore never started: setting `applying` is a second write.
+      const lostBroken = s.state === 'awaiting_reclick' && p?.pending?.action === 'broken' && p.pending.pause === 'awaiting_reclick';
+      if (s.state === 'applying' || lostBroken) {
+        if (p) { delete p.token; save(p, 'recovery_required'); }
+        store.setStatus('recovery_required', { proposalId: s.proposalId });
+        await tell({ title: 'Recovery required', body: `The watcher stopped ${lostBroken ? 'before undoing a fix' : 'while applying a fix'}. Run: node watcher.mjs reset` });
+      } else if (s.state === 'analyzing') {
+        store.setStatus('idle'); // the dump is still unseen, so the next check analyzes it again
+      }
+    },
   };
 }
 

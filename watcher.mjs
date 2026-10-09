@@ -1,18 +1,28 @@
 #!/usr/bin/env node
-// Dump watcher: kernel trace → agent → phone approval → apply.
-// Usage: node watcher.mjs [start | analyze <dump-id> | reset]
+// Dump watcher: kernel trace → engine → phone approval → apply.
+// Usage: node watcher.mjs [--engine claude|langgraph] [start | analyze <dump-id> | reset]
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { agentArgs, createStore, createWatcher, isDumpSavedLine, parseAgentStream, renderPage, resetLab } from './core.mjs';
+import { parseArgs } from 'node:util';
+import { agentArgs, claudeEngine, createStore, createWatcher, isDumpSavedLine, parseAgentStream, renderPage, resetLab } from './core.mjs';
 import { connectVsp } from './vsp.mjs';
 
 if (existsSync('.env')) process.loadEnvFile('.env');
-const { NTFY_TOPIC, DEMO_USER = 'DEMO', PORT = '8790', AGENT_MODEL } = process.env;
+const { NTFY_TOPIC, DEMO_USER = 'DEMO', PORT = '8790', AGENT_MODEL, CRASH_AFTER } = process.env;
+// Tracing needs the key; without it LangSmith stays off and the engine still works.
+if (process.env.LANGSMITH_API_KEY) {
+  process.env.LANGSMITH_TRACING ??= 'true';
+  process.env.LANGSMITH_PROJECT ??= 'dump-watcher';
+}
+// v1 runs on the Claude Code sign-in, even when the API key is set for v2.
+const { ANTHROPIC_API_KEY: _apiKey, ...agentEnv } = process.env;
 const PID_FILE = 'state/watcher.pid';
+const GRAPH_DB = 'state/graph.sqlite';
+const USAGE = 'Usage: node watcher.mjs [--engine claude|langgraph] [start | analyze <dump-id> | reset]';
 const TRACE_ARGS = ['-o', 'LogLevel=ERROR', '-o', 'BatchMode=yes', 'vps',
   "docker exec a4h25 sh -c 'tail -F -n0 /usr/sap/A4H/D00/work/dev_w*'"];
 // Reset order: the tests first, so the class activates together with its baseline tests.
@@ -31,6 +41,12 @@ function running() {
 function printStep(line) {
   let event;
   try { event = JSON.parse(line); } catch { return; }
+  if (event.type === 'result') {
+    const u = event.usage ?? {};
+    const input = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+    log(`agent result: ${event.num_turns} turns, ${input} input and ${u.output_tokens ?? 0} output tokens, $${event.total_cost_usd ?? '?'}`);
+    return;
+  }
   if (event.type !== 'assistant') return;
   for (const b of event.message?.content ?? []) {
     if (b.type === 'tool_use') log(`  agent → ${b.name.replace(/^mcp__vsp-lab__/, '')} ${b.input?.name ?? b.input?.object_url ?? ''}`);
@@ -41,7 +57,7 @@ function printStep(line) {
 function runAgent(summary) {
   log('agent started');
   return new Promise((resolve, reject) => {
-    const child = spawn('claude', agentArgs(AGENT_MODEL), { stdio: ['pipe', 'pipe', 'inherit'] });
+    const child = spawn('claude', agentArgs(AGENT_MODEL), { stdio: ['pipe', 'pipe', 'inherit'], env: agentEnv });
     const lines = [];
     const timer = setTimeout(() => { child.kill(); reject(new Error('the agent took longer than 5 minutes')); }, 5 * 60_000);
     createInterface({ input: child.stdout }).on('line', (line) => { lines.push(line); printStep(line); });
@@ -126,9 +142,29 @@ function followTrace(onDump) {
   process.on('exit', () => child?.kill());
 }
 
-const [command = 'start', arg] = process.argv.slice(2);
-if (!['start', 'analyze', 'reset'].includes(command)) {
-  console.error('Usage: node watcher.mjs [start | analyze <dump-id> | reset]');
+// CRASH_AFTER=<point> (decision, beforePush, push, testInclude, writeFix, restoreOriginal, enter:<step>,
+// threadEnd) kills the watcher there, for the crash rehearsals.
+async function crash(point) {
+  if (point !== CRASH_AFTER) return;
+  log(`CRASH_AFTER=${point}: killing the watcher`);
+  process.kill(process.pid, 'SIGKILL');
+}
+
+let cli;
+try {
+  cli = parseArgs({ options: { engine: { type: 'string', default: 'claude' } }, allowPositionals: true });
+} catch {
+  console.error(USAGE);
+  process.exit(1);
+}
+const engineName = cli.values.engine;
+const [command = 'start', arg] = cli.positionals;
+if (!['start', 'analyze', 'reset'].includes(command) || !['claude', 'langgraph'].includes(engineName)) {
+  console.error(USAGE);
+  process.exit(1);
+}
+if (engineName === 'langgraph' && command !== 'reset' && (!AGENT_MODEL || !process.env.ANTHROPIC_API_KEY)) {
+  console.error('--engine langgraph needs AGENT_MODEL and ANTHROPIC_API_KEY, in .env or the environment (README, "Two engines")');
   process.exit(1);
 }
 if (running()) {
@@ -140,21 +176,34 @@ const vsp = await connectVsp();
 
 if (command === 'reset') {
   await resetLab({ vsp, store }, LAB_FILES.map((f) => ({ ...f, source: readFileSync(f.file, 'utf8') })));
-  log('lab reset to its broken baseline; open proposals cancelled');
+  for (const f of [GRAPH_DB, `${GRAPH_DB}-wal`, `${GRAPH_DB}-shm`]) rmSync(f, { force: true });
+  log('lab reset to its broken baseline; open proposals cancelled; graph checkpoints deleted');
   await vsp.close();
   process.exit(0);
 }
 
+// The LangGraph engine loads only when asked for, so v1 starts without LangChain.
+async function loadEngine() {
+  if (engineName === 'claude') return claudeEngine;
+  const [{ createLanggraphEngine }, { createModels }, { SqliteSaver }] = await Promise.all([
+    import('./graph.mjs'), import('./models.mjs'), import('@langchain/langgraph-checkpoint-sqlite'),
+  ]);
+  const models = createModels({ vsp, model: AGENT_MODEL, log });
+  const checkpointer = SqliteSaver.fromConnString(GRAPH_DB);
+  return (ctx) => createLanggraphEngine(ctx, { models, checkpointer });
+}
+
 const host = command === 'start' ? execFileSync('tailscale', ['ip', '-4'], { encoding: 'utf8' }).trim().split('\n')[0] : '127.0.0.1';
 const watcher = createWatcher({
-  vsp, store, runAgent, notify, diff, log, demoUser: DEMO_USER,
+  vsp, store, runAgent, notify, diff, log, crash, demoUser: DEMO_USER, engine: await loadEngine(),
   pageUrl: (id, view) => `http://${host}:${PORT}/p/${id}?v=${view}`,
 });
 
 if (command === 'analyze') {
-  if (!arg) { console.error('Usage: node watcher.mjs analyze <dump-id>'); process.exit(1); }
+  if (!arg) { console.error('Usage: node watcher.mjs [--engine claude|langgraph] analyze <dump-id>'); process.exit(1); }
   const p = await watcher.analyzeOnce(arg);
   console.log(JSON.stringify({ ...p, token: undefined, view: undefined }, null, 2));
+  if (engineName === 'langgraph') await (await import('@langchain/core/callbacks/promises')).awaitAllCallbacks(); // send the trace before exiting
   await vsp.close();
   process.exit(0);
 }
@@ -170,4 +219,4 @@ followTrace(() => watcher.afterTraceLine().catch((err) => log(`check failed: ${e
 setInterval(check, 5 * 60_000);
 setInterval(() => watcher.expireOpen().catch((err) => log(`expiry failed: ${err.message}`)), 60_000);
 await watcher.checkDumps(24 * 60 * 60_000).catch((err) => log(`check failed: ${err.message}`));
-log(`watching dumps of ${DEMO_USER}; proposal pages on http://${host}:${PORT}`);
+log(`watching dumps of ${DEMO_USER} with the ${engineName} engine; proposal pages on http://${host}:${PORT}`);

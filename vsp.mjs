@@ -17,5 +17,6 @@ export async function connectVsp(server = 'vsp-lab') {
       try { return JSON.parse(text); } catch { return text; }
     },
     close: () => client.close(),
+    listTools: async () => (await client.listTools()).tools,
   };
 }
